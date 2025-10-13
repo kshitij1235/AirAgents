@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional
 from abc import ABC, abstractmethod
 
 
-class Tool(ABC):
+class Tools(ABC):
     """
     Base class for all Air tools.
 

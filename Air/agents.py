@@ -1,4 +1,3 @@
-# Air/agent.py
 import os
 import asyncio
 import json
@@ -7,6 +6,7 @@ import msgpack
 
 from Air.logging import logging_instance as log
 from Air.llm import LLM
+from Air.tools import Tools
 
 
 class Agent:
@@ -29,10 +29,9 @@ class Agent:
         role: str,
         description: str,
         goal: str,
-        tools: Optional[List[Any]] = None,
+        tools: Optional[List[Tools]] = None,
         llm_config: Optional[Dict[str, Any]] = None,
         cache_dir: Optional[str] = "fast_agents_cache/agents",
-        preload: bool = False,
         verbose: bool = True,
     ):
         self.name = name
@@ -42,7 +41,7 @@ class Agent:
         self.tools = tools or []
         self.llm_config = llm_config or {}
         self.verbose = verbose
-        self.agent_obj: Optional[LLM] = None
+        self.llm: Optional[LLM] = None
 
         # === Disk Caching ===
         self.cache_dir = cache_dir
@@ -58,15 +57,13 @@ class Agent:
         # === Load cached config if possible ===
         if self.cache_dir:
             self._load_config()
-        else:
-            self._save_config = lambda: None
 
         if self.verbose:
-            log.dim(f"🌬️ Air Agent '{self.name}' ready")
-            log.dim(f"Role: {self.role}")
-            log.info(f"Goal: {self.goal}")
+            log.success(f"{self.name} initialized")
+            log.info(f"Role: {self.role} | Goal: {self.goal}")
             if self.tools:
-                log.info(f"Tools: {', '.join([t.name for t in self.tools])}")
+                tool_names = ", ".join([t.name for t in self.tools])
+                log.debug(f"Tools available: {tool_names}")
 
     def _build_system_prompt(self) -> str:
         """Build system prompt including tool information."""
@@ -92,11 +89,11 @@ class Agent:
 
         tools_section += (
             "\n=== OPTIONAL TOOL USAGE ===\n"
-            "You MAY use tools if you think they will help. It's optional.\n"
+            "You MAY use tools if they will help. It's optional.\n"
             "To use a tool, return JSON in this format:\n"
             '{"action": "use_tool", "tool": "tool_name", "params": {"param1": "value1", ...}}\n'
-            "The tool will execute and return results. You can then use those results in your answer.\n"
-            "You can also provide your answer directly without using any tools.\n"
+            "The tool will execute and return results. Use them to answer the question.\n"
+            "You can provide an answer directly without using any tools.\n"
         )
 
         return base_prompt + tools_section
@@ -112,12 +109,12 @@ class Agent:
                     data = msgpack.unpackb(f.read(), strict_map_key=False)
                 self.llm_config = data.get("llm_config", self.llm_config)
                 if self.verbose:
-                    log.fade(f"Loaded cache for agent '{self.name}'.")
+                    log.cache_load(self.name)
             else:
                 self._save_config()
         except Exception as e:
             if self.verbose:
-                log.warn(f"Cache load failed for '{self.name}': {e}")
+                log.cache_fail(self.name, str(e))
 
     def _save_config(self):
         """Persist agent configuration using MessagePack."""
@@ -132,20 +129,20 @@ class Agent:
             with open(self._config_path, "wb") as f:
                 f.write(msgpack.packb(config, use_bin_type=True))
             if self.verbose:
-                log.dim(f"Saved agent '{self.name}' configuration.")
+                log.cache_save(self.name)
         except Exception as e:
             if self.verbose:
-                log.warn(f"Failed to save '{self.name}' config: {e}")
+                log.cache_fail(self.name, str(e))
 
     # =====================================================================
     # LLM Initialization
     # =====================================================================
     async def _ensure_llm(self):
         """Initialize LLM on first use."""
-        if not self.agent_obj:
-            self.agent_obj = LLM(**self.llm_config)
+        if not self.llm:
+            self.llm = LLM(**self.llm_config)
             if self.verbose:
-                log.fade(f"LLM for '{self.name}' initialized.")
+                log.debug(f"LLM initialized for {self.name}")
 
     # =====================================================================
     # Tool Execution
@@ -170,28 +167,25 @@ class Agent:
             if tool.name == tool_name:
                 try:
                     if self.verbose:
-                        log.info(f"  ⚙ Tool input: {tool_name}")
-                        log.dim(f"     params: {json.dumps(params, indent=6)}")
+                        log.agent_tool_use(self.name, tool_name, params)
 
                     result = tool.run(**params)
 
                     if self.verbose:
-                        log.success(f"  ⚙ Tool output: {tool_name}")
-                        log.dim(
-                            f"     result: {result[:200]}{'...' if len(result) > 200 else ''}"
-                        )
+                        log.tool_result(tool_name, True, result)
 
                     return result
+
                 except Exception as e:
-                    error_msg = json.dumps({"error": f"Tool execution failed: {e}"})
                     if self.verbose:
-                        log.error(f"  ⚙ Tool error: {tool_name}")
-                        log.error(f"     {str(e)}")
+                        log.agent_error(self.name, f"Tool '{tool_name}' failed: {e}")
+                    error_msg = json.dumps({"error": f"Tool execution failed: {e}"})
                     return error_msg
 
-        error_msg = json.dumps({"error": f"Tool '{tool_name}' not found"})
+        # Tool not found
         if self.verbose:
-            log.error(f"  ⚙ Tool not found: {tool_name}")
+            log.agent_error(self.name, f"Tool '{tool_name}' not found")
+        error_msg = json.dumps({"error": f"Tool '{tool_name}' not found"})
         return error_msg
 
     # =====================================================================
@@ -200,10 +194,9 @@ class Agent:
     async def run_async(self, input_data: Optional[str] = None) -> str:
         """
         Run agent asynchronously with multi-turn tool support.
-
         Keeps looping until LLM stops requesting tools or max turns reached.
         """
-        if not self.agent_obj:
+        if not self.llm:
             await self._ensure_llm()
 
         messages = [{"role": "system", "content": self._system_prompt}]
@@ -222,10 +215,10 @@ class Agent:
 
             try:
                 # Get response from LLM
-                if hasattr(self.agent_obj, "predict_async"):
-                    response = await self.agent_obj.predict_async(messages)
+                if hasattr(self.llm, "predict_async"):
+                    response = await self.llm.predict_async(messages)
                 else:
-                    response = self.agent_obj.predict(messages)
+                    response = self.llm.predict(messages)
 
                 text = getattr(response, "content", str(response))
                 text = text.strip() if isinstance(text, str) else str(text).strip()
@@ -237,9 +230,6 @@ class Agent:
                     # Execute tool
                     tool_name = tool_call.get("tool", "")
                     params = tool_call.get("params", {})
-
-                    if self.verbose:
-                        log.agent_tool_use(self.name, tool_name)
 
                     tool_result = self._execute_tool(tool_name, params)
 

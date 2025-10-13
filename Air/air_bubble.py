@@ -1,8 +1,7 @@
-# Air/airbubble.py
 import os
 import asyncio
 import pickle
-from typing import Any, Dict, List, Optional, Sequence, Literal
+from typing import Any, Dict, List, Optional, Sequence, Literal, Callable
 
 from Air.agents import Agent
 from Air.llm import LLM
@@ -43,6 +42,25 @@ class AirBubble:
             log.init_bubble(self.name, len(self._agents), self.mode)
 
     # ====================================================================
+    # Helper: Extract text from response objects
+    # ====================================================================
+    @staticmethod
+    def _extract_text(response: Any) -> str:
+        """Extract and clean text from response object."""
+        text = getattr(response, "content", str(response))
+        return text.strip() if isinstance(text, str) else str(text).strip()
+
+    # ====================================================================
+    # Helper: Build formatted prompt
+    # ====================================================================
+    def _build_prompt(self, instruction: str, context: str = "") -> str:
+        """Build a standard prompt with goal and context."""
+        prompt = f"GLOBAL GOAL: {self.goal}\n{instruction}"
+        if context:
+            prompt += f"\n{context}"
+        return prompt
+
+    # ====================================================================
     # Agent Management
     # ====================================================================
     def register_agent(self, agent: Agent):
@@ -79,21 +97,34 @@ class AirBubble:
         return obj
 
     # ====================================================================
-    # Execution: ASYNC (parallel, default)
+    # Execution: Helper for running single agent
     # ====================================================================
-    async def _run_agent_task(self, agent: Agent, prompt: str) -> Dict[str, str]:
-        """Run a single agent and return its output."""
+    def _run_agent_sync(self, agent: Agent, prompt: str) -> Dict[str, str]:
+        """Run a single agent synchronously."""
         try:
-            response = await agent.run_async(prompt)
-            text = getattr(response, "content", str(response))
-            text = text.strip() if isinstance(text, str) else str(text).strip()
+            response = agent.run_sync(prompt)
+            text = self._extract_text(response)
             return {"name": agent.name, "output": text, "error": None}
         except Exception as e:
             return {"name": agent.name, "output": "", "error": str(e)}
 
+    async def _run_agent_async(self, agent: Agent, prompt: str) -> Dict[str, str]:
+        """Run a single agent asynchronously."""
+        try:
+            response = await agent.run_async(prompt)
+            text = self._extract_text(response)
+            return {"name": agent.name, "output": text, "error": None}
+        except Exception as e:
+            return {"name": agent.name, "output": "", "error": str(e)}
+
+    # ====================================================================
+    # Execution: ASYNC (parallel)
+    # ====================================================================
     async def _run_all_agents_async(self, prompt: str) -> List[Dict[str, str]]:
         """Run all agents concurrently."""
-        tasks = [self._run_agent_task(agent, prompt) for agent in self._agents.values()]
+        tasks = [
+            self._run_agent_async(agent, prompt) for agent in self._agents.values()
+        ]
         return await asyncio.gather(*tasks, return_exceptions=False)
 
     # ====================================================================
@@ -101,22 +132,10 @@ class AirBubble:
     # ====================================================================
     def _run_all_agents_sync(self, prompt: str) -> List[Dict[str, str]]:
         """Run all agents sequentially."""
-        results = []
-        for agent in self._agents.values():
-            try:
-                response = agent.run_sync(prompt)
-                text = (
-                    getattr(response, "content", str(response))
-                    if hasattr(response, "content")
-                    else str(response)
-                )
-                results.append({"name": agent.name, "output": text, "error": None})
-            except Exception as e:
-                results.append({"name": agent.name, "output": "", "error": str(e)})
-        return results
+        return [self._run_agent_sync(agent, prompt) for agent in self._agents.values()]
 
     # ====================================================================
-    # Execution: CHAIN (output of one agent feeds to next)
+    # Execution: CHAIN (output feeds to next)
     # ====================================================================
     def _run_chain_mode(self, user_input: str) -> List[Dict[str, str]]:
         """Chain mode: each agent's output feeds to the next agent."""
@@ -128,18 +147,16 @@ class AirBubble:
                 if self.verbose:
                     log.agent_thinking(agent.name)
 
-                prompt = (
-                    f"GLOBAL GOAL: {self.goal}\n"
-                    f"PREVIOUS OUTPUT:\n{current_input}\n"
-                    f"Now analyze and build upon the above."
+                prompt = self._build_prompt(
+                    "Analyze and build upon the above.",
+                    f"PREVIOUS OUTPUT:\n{current_input}",
                 )
 
                 response = agent.run_sync(prompt)
-                text = getattr(response, "content", str(response))
-                text = text.strip() if isinstance(text, str) else str(text).strip()
+                text = self._extract_text(response)
 
                 results.append({"name": agent.name, "output": text, "error": None})
-                current_input = text  # Pass output to next agent
+                current_input = text
 
                 if self.verbose:
                     log.agent_done(agent.name, text)
@@ -155,20 +172,15 @@ class AirBubble:
     # Execution: DISCUSSION (agents discuss, main LLM moderates)
     # ====================================================================
     def _run_discussion_mode(self, user_input: str) -> str:
-        """
-        Discussion mode: agents provide viewpoints, main LLM synthesizes.
-        Token-efficient: stores only summaries, not full conversation history.
-        """
+        """Discussion mode: agents provide viewpoints, main LLM synthesizes."""
         if self.verbose:
             log.discussion_start()
 
-        agent_prompt = (
-            f"GLOBAL GOAL: {self.goal}\n"
-            f"USER QUESTION: {user_input}\n"
-            f"Provide your perspective and analysis."
+        agent_prompt = self._build_prompt(
+            "Provide your perspective and analysis.", f"USER QUESTION: {user_input}"
         )
 
-        # Round 1: Collect initial perspectives
+        # Collect initial perspectives
         perspectives = []
         for agent in self._agents.values():
             try:
@@ -176,8 +188,7 @@ class AirBubble:
                     log.agent_thinking(agent.name)
 
                 response = agent.run_sync(agent_prompt)
-                text = getattr(response, "content", str(response))
-                text = text.strip()[:300]  # Limit to prevent token bloat
+                text = self._extract_text(response)[:300]  # Limit token bloat
 
                 perspectives.append({"agent": agent.name, "view": text})
 
@@ -189,44 +200,21 @@ class AirBubble:
                     log.agent_error(agent.name, str(e))
 
         # Main LLM moderates and synthesizes
-        perspective_text = "\n\n".join(
-            [f"[{p['agent']}]: {p['view']}" for p in perspectives]
-        )
-
-        moderation_prompt = (
-            f"DISCUSSION TOPIC: {self.goal}\n"
-            f"USER QUESTION: {user_input}\n\n"
-            f"AGENT PERSPECTIVES:\n{perspective_text}\n\n"
+        return self._synthesize_with_llm(
             f"As a moderator, synthesize these perspectives into a cohesive response. "
-            f"Identify areas of agreement, highlight key disagreements, and provide a balanced conclusion."
+            f"Identify areas of agreement, highlight key disagreements, and provide a balanced conclusion.",
+            "You are a discussion moderator synthesizing multiple expert perspectives.",
+            perspectives_text="\n\n".join(
+                [f"[{p['agent']}]: {p['view']}" for p in perspectives]
+            ),
+            user_input=user_input,
         )
-
-        try:
-            messages = [
-                {
-                    "role": "system",
-                    "content": "You are a discussion moderator synthesizing multiple expert perspectives.",
-                },
-                {"role": "user", "content": moderation_prompt},
-            ]
-            response = self._final_llm.predict(messages)
-            result = getattr(response, "content", str(response)).strip()
-
-        except Exception as e:
-            result = f"DISCUSSION ERROR: {e}"
-            if self.verbose:
-                log.synthesis_error(str(e))
-
-        return result
 
     # ====================================================================
     # Execution: HIERARCHY (tree of agents, bottom-up synthesis)
     # ====================================================================
     def _run_hierarchy_mode(self, user_input: str) -> str:
-        """
-        Hierarchy mode: all agents think independently, then layer by layer
-        synthesize up the tree. Each level summarizes before passing up.
-        """
+        """Hierarchy mode: all agents think independently, then synthesize up."""
         if self.verbose:
             log.hierarchy_start()
 
@@ -239,14 +227,12 @@ class AirBubble:
                 if self.verbose:
                     log.agent_thinking(agent.name)
 
-                prompt = (
-                    f"GLOBAL GOAL: {self.goal}\n"
-                    f"USER INPUT: {user_input}\n"
-                    f"Provide detailed analysis."
+                prompt = self._build_prompt(
+                    "Provide detailed analysis.", f"USER INPUT: {user_input}"
                 )
 
                 response = agent.run_sync(prompt)
-                text = getattr(response, "content", str(response)).strip()[:500]
+                text = self._extract_text(response)[:500]
 
                 level_outputs[agent.name] = text
 
@@ -265,31 +251,18 @@ class AirBubble:
             if self.verbose:
                 log.hierarchy_level(level_num, len(current_level))
 
-            # Group outputs and summarize
             combined = "\n\n".join(
                 [f"[{name}]: {output}" for name, output in current_level.items()]
             )
 
-            summary_prompt = (
-                f"GOAL: {self.goal}\n"
-                f"INPUT: {user_input}\n\n"
-                f"AGENT CONTRIBUTIONS:\n{combined}\n\n"
-                f"Summarize the key points and insights in 200 words maximum."
-            )
-
             try:
-                messages = [
-                    {
-                        "role": "system",
-                        "content": "Summarize the following insights concisely.",
-                    },
-                    {"role": "user", "content": summary_prompt},
-                ]
-                response = self._final_llm.predict(messages)
-                summary = getattr(response, "content", str(response)).strip()
-
-                # Move to next level
-                current_level = {f"Level_{level_num}": summary}
+                result = self._synthesize_with_llm(
+                    "Summarize the key points and insights in 200 words maximum.",
+                    "Summarize the following insights concisely.",
+                    agent_contributions=combined,
+                    user_input=user_input,
+                )
+                current_level = {f"Level_{level_num}": result}
                 level_num += 1
 
             except Exception as e:
@@ -297,9 +270,47 @@ class AirBubble:
                     log.synthesis_error(str(e))
                 return f"HIERARCHY ERROR: {e}"
 
-        # Return final result
-        final_result = list(current_level.values())[0] if current_level else ""
-        return final_result
+        return list(current_level.values())[0] if current_level else ""
+
+    # ====================================================================
+    # Synthesis: LLM helper (consolidates all synthesis calls)
+    # ====================================================================
+    def _synthesize_with_llm(
+        self,
+        task_instruction: str,
+        system_role: str,
+        agent_contributions: str = "",
+        perspectives_text: str = "",
+        user_input: str = "",
+    ) -> str:
+        """Generic LLM synthesis helper."""
+        content_parts = [f"GOAL: {self.goal}"]
+
+        if user_input:
+            content_parts.append(f"USER INPUT: {user_input}")
+
+        if agent_contributions:
+            content_parts.append(f"AGENT CONTRIBUTIONS:\n{agent_contributions}")
+
+        if perspectives_text:
+            content_parts.append(f"AGENT PERSPECTIVES:\n{perspectives_text}")
+
+        content_parts.append(task_instruction)
+
+        synthesis_prompt = "\n\n".join(content_parts)
+
+        try:
+            messages = [
+                {"role": "system", "content": system_role},
+                {"role": "user", "content": synthesis_prompt},
+            ]
+            response = self._final_llm.predict(messages)
+            return self._extract_text(response)
+
+        except Exception as e:
+            if self.verbose:
+                log.synthesis_error(str(e))
+            return f"SYNTHESIS ERROR: {e}"
 
     # ====================================================================
     # Main Execution Router
@@ -309,25 +320,24 @@ class AirBubble:
         if self.verbose:
             log.bubble_start(self.name, self.goal, user_input, self.mode)
 
-        if self.mode == "async":
-            return self._run_mode_async(user_input)
-        elif self.mode == "sync":
-            return self._run_mode_sync(user_input)
-        elif self.mode == "chain":
-            return self._run_mode_chain(user_input)
-        elif self.mode == "discussion":
-            return self._run_mode_discussion(user_input)
-        elif self.mode == "hierarchy":
-            return self._run_mode_hierarchy(user_input)
-        else:
-            raise ValueError(f"Unknown mode: {self.mode}")
+        match self.mode:
+            case "async":
+                return self._run_mode_async(user_input)
+            case "sync":
+                return self._run_mode_sync(user_input)
+            case "chain":
+                return self._run_mode_chain(user_input)
+            case "discussion":
+                return self._run_mode_discussion(user_input)
+            case "hierarchy":
+                return self._run_mode_hierarchy(user_input)
+            case _:
+                raise ValueError(f"Unknown mode: {self.mode}")
 
     def _run_mode_async(self, user_input: str) -> str:
         """ASYNC mode: all agents run in parallel."""
-        agent_prompt = (
-            f"GLOBAL GOAL: {self.goal}\n"
-            f"USER INPUT: {user_input}\n"
-            f"Provide your analysis and insights."
+        agent_prompt = self._build_prompt(
+            "Provide your analysis and insights.", f"USER INPUT: {user_input}"
         )
 
         loop = asyncio.new_event_loop()
@@ -338,10 +348,8 @@ class AirBubble:
 
     def _run_mode_sync(self, user_input: str) -> str:
         """SYNC mode: all agents run sequentially."""
-        agent_prompt = (
-            f"GLOBAL GOAL: {self.goal}\n"
-            f"USER INPUT: {user_input}\n"
-            f"Provide your analysis and insights."
+        agent_prompt = self._build_prompt(
+            "Provide your analysis and insights.", f"USER INPUT: {user_input}"
         )
 
         results = self._run_all_agents_sync(agent_prompt)
@@ -350,8 +358,6 @@ class AirBubble:
     def _run_mode_chain(self, user_input: str) -> str:
         """CHAIN mode: agent output feeds to next agent."""
         results = self._run_chain_mode(user_input)
-
-        # Last agent output is the final answer
         final_output = results[-1]["output"] if results else ""
 
         if self.verbose:
@@ -391,7 +397,6 @@ class AirBubble:
                 else:
                     log.agent_result(res["name"], res["output"])
 
-        # Build synthesis prompt
         agent_contributions = "\n\n".join(
             [
                 (
@@ -403,29 +408,13 @@ class AirBubble:
             ]
         )
 
-        synthesis_prompt = (
-            f"GLOBAL GOAL: {self.goal}\n"
-            f"USER INPUT: {user_input}\n\n"
-            f"AGENT CONTRIBUTIONS:\n{agent_contributions}\n\n"
-            f"Synthesize these contributions into a clear, actionable response. "
-            f"Highlight key insights, resolve conflicts, provide next steps."
+        final_text = self._synthesize_with_llm(
+            "Synthesize these contributions into a clear, actionable response. "
+            "Highlight key insights, resolve conflicts, provide next steps.",
+            "You are a synthesis agent combining insights from multiple specialized agents.",
+            agent_contributions=agent_contributions,
+            user_input=user_input,
         )
-
-        try:
-            messages = [
-                {
-                    "role": "system",
-                    "content": "You are a synthesis agent combining insights from multiple specialized agents.",
-                },
-                {"role": "user", "content": synthesis_prompt},
-            ]
-            final_response = self._final_llm.predict(messages)
-            final_text = getattr(final_response, "content", str(final_response))
-            final_text = final_text.strip()
-        except Exception as e:
-            if self.verbose:
-                log.synthesis_error(str(e))
-            final_text = f"SYNTHESIS ERROR: {e}"
 
         if self.verbose:
             log.bubble_done(final_text)

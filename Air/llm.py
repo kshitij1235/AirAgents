@@ -115,6 +115,12 @@ class LLM:
             raise RuntimeError("No LLM configured.")
         return self.llm.invoke(messages)
 
+    async def predict_async(self, messages) -> BaseMessage:
+        """async blocking call to model."""
+        if not self.llm:
+            raise RuntimeError("No LLM configured.")
+        return self.llm.invoke(messages)
+
     def stream_predict(self, messages):
         """Stream output from the model."""
         if not self.llm:
